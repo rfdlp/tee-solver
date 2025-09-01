@@ -2,8 +2,8 @@ use dcap_qvl::{verify, QuoteCollateralV3};
 use hex::{decode, encode};
 use near_sdk::{
     assert_one_yocto,
-    env::{self, block_timestamp},
-    ext_contract, log, near, require,
+    env::{self, block_timestamp, block_timestamp_ms},
+    ext_contract, near, require,
     store::{IterableMap, IterableSet, Vector},
     AccountId, Gas, NearToken, PanicOnDefault, Promise, PromiseError, PublicKey,
 };
@@ -18,7 +18,7 @@ mod events;
 mod ext;
 mod pool;
 mod token_receiver;
-mod types;
+pub mod types;
 mod upgrade;
 mod view;
 
@@ -40,6 +40,7 @@ pub struct Contract {
     pools: Vector<Pool>,
     approved_codehashes: IterableSet<String>,
     worker_by_account_id: IterableMap<AccountId, Worker>,
+    worker_ping_timeout_ms: TimestampMs,
 }
 
 #[allow(dead_code)]
@@ -52,13 +53,18 @@ trait IntentsVaultContract {
 impl Contract {
     #[init]
     #[private]
-    pub fn new(owner_id: AccountId, intents_contract_id: AccountId) -> Self {
+    pub fn new(
+        owner_id: AccountId,
+        intents_contract_id: AccountId,
+        worker_ping_timeout_ms: TimestampMs,
+    ) -> Self {
         Self {
             owner_id,
             intents_contract_id,
             pools: Vector::new(Prefix::Pools),
             approved_codehashes: IterableSet::new(Prefix::ApprovedCodeHashes),
             worker_by_account_id: IterableMap::new(Prefix::WorkerByAccountId),
+            worker_ping_timeout_ms,
         }
     }
 
@@ -72,7 +78,17 @@ impl Contract {
         tcb_info: String,
     ) -> Promise {
         assert_one_yocto();
-        require!(self.has_pool(pool_id), "Pool not found");
+        let pool = self.pools.get(pool_id).expect("Pool not found");
+        let worker_id = env::predecessor_account_id();
+        // register new worker is allowed only if there's no active worker and the worker is not already registered
+        require!(
+            !pool.has_active_worker(self.worker_ping_timeout_ms),
+            "Only one active worker is allowed per pool"
+        );
+        require!(
+            pool.worker_id.is_none() || pool.worker_id.as_ref().unwrap() != &worker_id,
+            "Worker already registered"
+        );
 
         let collateral = collateral::get_collateral(collateral);
         let quote = decode(quote_hex).unwrap();
@@ -98,12 +114,6 @@ impl Contract {
         // only allow workers with approved code hashes to register
         let codehash = collateral::verify_codehash(tcb_info, rtmr3);
         self.assert_approved_codehash(&codehash);
-
-        log!("verify result: {:?}", result);
-
-        // TODO: verify predecessor implicit account is derived from this public key
-
-        let worker_id = env::predecessor_account_id();
 
         // add the public key to the intents vault
         ext_intents_vault::ext(self.get_pool_account_id(pool_id))
@@ -136,6 +146,12 @@ impl Contract {
                 },
             );
 
+            // Update the pool with the worker ID and last ping timestamp
+            let pool = self.pools.get_mut(pool_id).expect("Pool not found");
+            pool.worker_id = Some(worker_id.clone());
+            pool.last_ping_timestamp_ms = block_timestamp_ms();
+            self.pools.flush();
+
             Event::WorkerRegistered {
                 worker_id: &worker_id,
                 pool_id: &pool_id,
@@ -146,6 +162,31 @@ impl Contract {
             .emit();
         }
     }
+
+    /// Heartbeat to notify the pool that the worker is still alive.
+    pub fn ping(&mut self) {
+        let worker_id = env::predecessor_account_id();
+        let worker = self
+            .get_worker(worker_id.clone())
+            .expect("Worker not found");
+        self.assert_approved_codehash(&worker.codehash);
+        let pool = self.pools.get_mut(worker.pool_id).expect("Pool not found");
+        let registered_worker_id = pool.worker_id.as_ref().expect("Worker not registered");
+        require!(
+            registered_worker_id == &worker_id,
+            "Only the registered worker can ping"
+        );
+
+        pool.last_ping_timestamp_ms = block_timestamp_ms();
+        self.pools.flush();
+
+        Event::WorkerPinged {
+            pool_id: &worker.pool_id,
+            worker_id: &worker_id,
+            timestamp_ms: &block_timestamp_ms(),
+        }
+        .emit();
+    }
 }
 
 impl Contract {
@@ -155,9 +196,4 @@ impl Contract {
             "Invalid code hash"
         );
     }
-
-    // fn require_approved_codehash(&self) {
-    //     let worker = self.get_worker(env::predecessor_account_id());
-    //     self.assert_approved_codehash(&worker.codehash);
-    // }
 }

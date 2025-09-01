@@ -2,6 +2,8 @@ use near_sdk::serde::Serialize;
 use near_sdk::serde_json::json;
 use near_sdk::{log, AccountId, PublicKey};
 
+use crate::types::TimestampMs;
+
 pub const EVENT_STANDARD: &str = "solver-registry";
 pub const EVENT_STANDARD_VERSION: &str = "1.0.0";
 
@@ -26,16 +28,21 @@ pub enum Event<'a> {
         token_ids: &'a Vec<AccountId>,
         fee: &'a u32,
     },
-    // AddLiquidity {
-    //     pool_id: &'a u32,
-    //     account_id: &'a AccountId,
-    //     amounts: &'a Vec<U128>,
-    // },
-    // RemoveLiquidity {
-    //     pool_id: &'a u32,
-    //     account_id: &'a AccountId,
-    //     amounts: &'a Vec<U128>,
-    // },
+    WorkerPinged {
+        pool_id: &'a u32,
+        worker_id: &'a AccountId,
+        timestamp_ms: &'a TimestampMs,
+    },
+    CodehashApproved {
+        codehash: &'a String,
+    },
+    CodehashRemoved {
+        codehash: &'a String,
+    },
+    OwnerChanged {
+        old_owner_id: &'a AccountId,
+        new_owner_id: &'a AccountId,
+    },
 }
 
 impl Event<'_> {

@@ -17,6 +17,8 @@ impl Contract {
             amounts: p.amounts.iter().map(|a| (*a).into()).collect(),
             fee: p.fee,
             shares_total_supply: p.shares_total_supply.into(),
+            worker_id: p.worker_id.clone(),
+            last_ping_timestamp_ms: p.last_ping_timestamp_ms,
         })
     }
 
@@ -34,5 +36,9 @@ impl Contract {
             .skip(offset as usize)
             .take(limit as usize)
             .collect()
+    }
+
+    pub fn get_worker_ping_timeout_ms(&self) -> TimestampMs {
+        self.worker_ping_timeout_ms
     }
 }
