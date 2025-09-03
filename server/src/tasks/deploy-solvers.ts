@@ -19,17 +19,21 @@ export async function deploySolvers() {
   logger.info(`Found ${poolsWithoutCvms.length} pools without CVMs: [${poolsWithoutCvms.join(', ')}]`);
 
   for (const poolId of poolsWithoutCvms) {
-    const pool = await solverRegistry.getPool(poolId);
-    logger.info(`Deploying solver for pool ${poolId}: ${JSON.stringify(pool, null, 2)}`);
+    try {
+      const pool = await solverRegistry.getPool(poolId);
+      logger.info(`Deploying solver for pool ${poolId}: ${JSON.stringify(pool, null, 2)}`);
 
-    // If the pool doesn't have enough balances in NEAR Intents, skip deploying solver CVM
-    if (!await solverRegistry.hasEnoughBalancesInPool(poolId)) {
-      logger.info(`Pool ${poolId} does not have enough balances, skipping`);
-      continue;
+      // If the pool doesn't have enough balances in NEAR Intents, skip deploying solver CVM
+      if (!await solverRegistry.hasEnoughBalancesInPool(poolId)) {
+        logger.info(`Pool ${poolId} does not have enough balances, skipping`);
+        continue;
+      }
+
+      await phala.createSolverCvm(poolId, pool.token_ids, pool.fee);
+      setTimeout(fundSolvers, 60 * 1000);
+    } catch (e) {
+      logger.error(`Failed to deploy solver for pool ${poolId}: ${e}`);
     }
-
-    await phala.createSolverCvm(poolId, pool.token_ids);
-    setTimeout(fundSolvers, 60 * 1000);
   }
 
   setTimeout(async () => {
