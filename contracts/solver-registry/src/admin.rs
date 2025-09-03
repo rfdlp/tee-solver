@@ -3,22 +3,31 @@ use near_sdk::near;
 
 #[near]
 impl Contract {
-    pub fn approve_codehash(&mut self, codehash: String) {
+    /// Approve a docker compose hash for worker registration
+    pub fn approve_compose_hash(&mut self, compose_hash: String) {
         self.assert_owner();
-        self.approved_codehashes.insert(codehash.clone());
+        DockerComposeHash::try_from_hex(compose_hash.clone()).expect("Invalid compose hash");
 
-        Event::CodehashApproved {
-            codehash: &codehash,
+        self.approved_compose_hashes.insert(compose_hash.clone());
+
+        Event::ComposeHashApproved {
+            compose_hash: &compose_hash,
         }
         .emit();
     }
 
-    pub fn remove_codehash(&mut self, codehash: String) {
+    /// Remove an approved docker compose hash
+    pub fn remove_compose_hash(&mut self, compose_hash: String) {
         self.assert_owner();
-        self.approved_codehashes.remove(&codehash);
+        DockerComposeHash::try_from_hex(compose_hash.clone()).expect("Invalid compose hash");
 
-        Event::CodehashRemoved {
-            codehash: &codehash,
+        require!(
+            self.approved_compose_hashes.remove(&compose_hash),
+            "Compose hash not found"
+        );
+
+        Event::ComposeHashRemoved {
+            compose_hash: &compose_hash,
         }
         .emit();
     }
@@ -37,7 +46,7 @@ impl Contract {
 }
 
 impl Contract {
-    pub(crate) fn assert_owner(&mut self) {
+    pub(crate) fn assert_owner(&self) {
         require!(env::predecessor_account_id() == self.owner_id);
     }
 }

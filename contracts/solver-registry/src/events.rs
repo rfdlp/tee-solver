@@ -20,7 +20,7 @@ pub enum Event<'a> {
         worker_id: &'a AccountId,
         pool_id: &'a u32,
         public_key: &'a PublicKey,
-        codehash: &'a String,
+        compose_hash: &'a String,
         checksum: &'a String,
     },
     CreateLiquidityPool {
@@ -33,11 +33,11 @@ pub enum Event<'a> {
         worker_id: &'a AccountId,
         timestamp_ms: &'a TimestampMs,
     },
-    CodehashApproved {
-        codehash: &'a String,
+    ComposeHashApproved {
+        compose_hash: &'a String,
     },
-    CodehashRemoved {
-        codehash: &'a String,
+    ComposeHashRemoved {
+        compose_hash: &'a String,
     },
     OwnerChanged {
         old_owner_id: &'a AccountId,

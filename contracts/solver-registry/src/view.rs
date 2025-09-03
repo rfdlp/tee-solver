@@ -7,6 +7,11 @@ impl Contract {
         self.owner_id.clone()
     }
 
+    /// Get all approved docker compose hashes
+    pub fn get_approved_compose_hashes(&self) -> Vec<String> {
+        self.approved_compose_hashes.iter().cloned().collect()
+    }
+
     pub fn get_pool_len(&self) -> u32 {
         self.pools.len()
     }

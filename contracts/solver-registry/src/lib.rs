@@ -1,22 +1,33 @@
-use dcap_qvl::{verify, QuoteCollateralV3};
-use hex::{decode, encode};
+extern crate alloc;
+
+use dstack_sdk_types::dstack::TcbInfo;
+use hex::decode;
 use near_sdk::{
     assert_one_yocto,
-    env::{self, block_timestamp, block_timestamp_ms},
+    env::{self, block_timestamp, block_timestamp_ms, sha256},
     ext_contract, near, require,
     store::{IterableMap, IterableSet, Vector},
     AccountId, Gas, NearToken, PanicOnDefault, Promise, PromiseError, PublicKey,
 };
+use std::str::FromStr;
 
+use crate::attestation::{
+    app_compose::AppCompose,
+    attestation::{Attestation, DstackAttestation},
+    collateral::Collateral,
+    hash::{DockerComposeHash, DockerImageHash},
+    quote::QuoteBytes,
+    report_data::ReportData,
+};
 use crate::events::*;
 use crate::pool::*;
 use crate::types::*;
 
 mod admin;
-mod collateral;
+mod attestation;
 mod events;
 mod ext;
-mod pool;
+pub mod pool;
 mod token_receiver;
 pub mod types;
 mod upgrade;
@@ -27,9 +38,9 @@ const GAS_REGISTER_WORKER_CALLBACK: Gas = Gas::from_tgas(10);
 #[near(serializers = [json, borsh])]
 #[derive(Clone)]
 pub struct Worker {
-    pool_id: u32,
-    checksum: String,
-    codehash: String,
+    pub pool_id: u32,
+    pub checksum: String,
+    pub compose_hash: String,
 }
 
 #[near(contract_state)]
@@ -38,7 +49,7 @@ pub struct Contract {
     owner_id: AccountId,
     intents_contract_id: AccountId,
     pools: Vector<Pool>,
-    approved_codehashes: IterableSet<String>,
+    approved_compose_hashes: IterableSet<String>,
     worker_by_account_id: IterableMap<AccountId, Worker>,
     worker_ping_timeout_ms: TimestampMs,
 }
@@ -62,12 +73,16 @@ impl Contract {
             owner_id,
             intents_contract_id,
             pools: Vector::new(Prefix::Pools),
-            approved_codehashes: IterableSet::new(Prefix::ApprovedCodeHashes),
+            approved_compose_hashes: IterableSet::new(Prefix::ApprovedComposeHashes),
             worker_by_account_id: IterableMap::new(Prefix::WorkerByAccountId),
             worker_ping_timeout_ms,
         }
     }
 
+    /// Register worker with TEE attestation. The worker needs to running inside a CVM with one of the approved docker compose hashes.
+    ///
+    /// The current TEE attestation module reuses the implementation from [NEAR MPC](https://github.com/near/mpc) TEE attestation with slight change.
+    /// Find more details about TEE attestation module in `attestation/README.md`.
     #[payable]
     pub fn register_worker(
         &mut self,
@@ -79,8 +94,9 @@ impl Contract {
     ) -> Promise {
         assert_one_yocto();
         let pool = self.pools.get(pool_id).expect("Pool not found");
+
+        // Register new worker is allowed only if there's no active worker and the worker is not already registered
         let worker_id = env::predecessor_account_id();
-        // register new worker is allowed only if there's no active worker and the worker is not already registered
         require!(
             !pool.has_active_worker(self.worker_ping_timeout_ms),
             "Only one active worker is allowed per pool"
@@ -90,39 +106,66 @@ impl Contract {
             "Worker already registered"
         );
 
-        let collateral = collateral::get_collateral(collateral);
-        let quote = decode(quote_hex).unwrap();
-        let now = block_timestamp() / 1000000000;
-        let result = verify::verify(&quote, &collateral, now).expect("Report is not verified");
-        let report = result.report.as_td10().unwrap();
-        let rtmr3 = encode(report.rt_mr3);
+        // Parse the attestation components
+        let quote_bytes = QuoteBytes::from(decode(&quote_hex).expect("Invalid quote hex"));
+        let collateral_data = Collateral::from_str(&collateral).expect("Invalid collateral format");
+        let tcb_info_data: TcbInfo =
+            serde_json::from_str(&tcb_info).expect("Invalid TCB info format");
 
-        // verify the signer public key is the same as the one included in the report data
-        let report_data = encode(report.report_data);
+        // Create the attestation
+        let attestation = Attestation::Dstack(DstackAttestation::new(
+            quote_bytes,
+            collateral_data,
+            tcb_info_data.clone(),
+        ));
+
+        // Get the signer's public key
         let public_key = env::signer_account_pk();
-        let public_key_str: String = (&public_key).into();
-        // pad the public key hex with 0 to 128 characters
-        let public_key_hex = format!("{:0>128}", encode(public_key_str));
+        // Create expected report data from the public key
+        let expected_report_data = ReportData::new(public_key.clone());
+
+        // Get current timestamp in seconds
+        let timestamp_s = block_timestamp() / 1_000_000_000;
+
+        // For now, allow all docker image hashes as we only verify the docker compose hash
+        let allowed_docker_image_hashes: Vec<DockerImageHash> = vec![];
+        let allowed_docker_compose_hashes: Vec<DockerComposeHash> = self
+            .approved_compose_hashes
+            .iter()
+            .map(|hash| DockerComposeHash::try_from_hex(hash).expect("Invalid compose hash"))
+            .collect();
+
+        // Verify the attestation
         require!(
-            public_key_hex == report_data,
-            format!(
-                "Invalid public key: {} v.s. {}",
-                public_key_hex, report_data
-            )
+            attestation.verify(
+                expected_report_data,
+                timestamp_s,
+                &allowed_docker_image_hashes,
+                &allowed_docker_compose_hashes,
+            ),
+            "Attestation verification failed"
         );
 
-        // only allow workers with approved code hashes to register
-        let codehash = collateral::verify_codehash(tcb_info, rtmr3);
-        self.assert_approved_codehash(&codehash);
+        // Extract docker compose hash from TCB info
+        let docker_compose_hash = self
+            .find_approved_compose_hash(&tcb_info_data, &allowed_docker_compose_hashes)
+            .expect("Invalid docker compose hash");
+        let docker_compose_hash_hex = docker_compose_hash.as_hex();
 
-        // add the public key to the intents vault
+        // Add the public key to the intents vault
         ext_intents_vault::ext(self.get_pool_account_id(pool_id))
             .with_attached_deposit(NearToken::from_yoctonear(1))
             .add_public_key(self.intents_contract_id.clone(), public_key.clone())
             .then(
                 Self::ext(env::current_account_id())
                     .with_static_gas(GAS_REGISTER_WORKER_CALLBACK)
-                    .on_worker_key_added(worker_id, pool_id, public_key, codehash, checksum),
+                    .on_worker_key_added(
+                        worker_id,
+                        pool_id,
+                        public_key,
+                        docker_compose_hash_hex,
+                        checksum,
+                    ),
             )
     }
 
@@ -132,7 +175,7 @@ impl Contract {
         worker_id: AccountId,
         pool_id: u32,
         public_key: PublicKey,
-        codehash: String,
+        compose_hash: String,
         checksum: String,
         #[callback_result] call_result: Result<(), PromiseError>,
     ) {
@@ -142,7 +185,7 @@ impl Contract {
                 Worker {
                     pool_id,
                     checksum: checksum.clone(),
-                    codehash: codehash.clone(),
+                    compose_hash: compose_hash.clone(),
                 },
             );
 
@@ -156,7 +199,7 @@ impl Contract {
                 worker_id: &worker_id,
                 pool_id: &pool_id,
                 public_key: &public_key,
-                codehash: &codehash,
+                compose_hash: &compose_hash,
                 checksum: &checksum,
             }
             .emit();
@@ -169,7 +212,7 @@ impl Contract {
         let worker = self
             .get_worker(worker_id.clone())
             .expect("Worker not found");
-        self.assert_approved_codehash(&worker.codehash);
+        self.assert_approved_compose_hash(&worker.compose_hash);
         let pool = self.pools.get_mut(worker.pool_id).expect("Pool not found");
         let registered_worker_id = pool.worker_id.as_ref().expect("Worker not registered");
         require!(
@@ -190,10 +233,29 @@ impl Contract {
 }
 
 impl Contract {
-    fn assert_approved_codehash(&self, codehash: &String) {
+    fn assert_approved_compose_hash(&self, compose_hash: &String) {
         require!(
-            self.approved_codehashes.contains(codehash),
-            "Invalid code hash"
+            self.approved_compose_hashes.contains(compose_hash),
+            "Invalid compose hash"
         );
+    }
+
+    fn find_approved_compose_hash(
+        &self,
+        tcb_info: &TcbInfo,
+        allowed_hashes: &[DockerComposeHash],
+    ) -> Option<DockerComposeHash> {
+        let app_compose: AppCompose = match serde_json::from_str(&tcb_info.app_compose) {
+            Ok(compose) => compose,
+            Err(e) => {
+                tracing::error!("Failed to parse app_compose JSON: {:?}", e);
+                return None;
+            }
+        };
+        let compose_hash = sha256(app_compose.docker_compose_file.as_bytes());
+        allowed_hashes
+            .iter()
+            .find(|hash| hash.as_hex() == hex::encode(&compose_hash))
+            .cloned()
     }
 }
