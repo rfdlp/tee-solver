@@ -8,7 +8,7 @@ async fn test_only_one_active_worker_per_pool() -> Result<(), Box<dyn std::error
     let sandbox = near_workspaces::sandbox().await?;
 
     // Setup test environment
-    let (wnear, usdc, owner, alice, bob, _mock_intents, solver_registry) =
+    let (wnear, usdc, owner, alice, bob, mock_intents, solver_registry) =
         setup_test_environment(&sandbox, 10 * 60 * 1000).await?;
 
     // Create a liquidity pool
@@ -16,6 +16,21 @@ async fn test_only_one_active_worker_per_pool() -> Result<(), Box<dyn std::error
 
     // Approve compose hash
     approve_compose_hash(&owner, &solver_registry).await?;
+
+    // Get pool account ID before worker registration
+    let pool_account_id = get_pool_account_id(&solver_registry, 0);
+    println!("\n [LOG] Pool Account ID: {}", pool_account_id);
+
+    // Verify no public keys exist for the pool initially
+    let initial_public_keys = get_pool_public_keys(&mock_intents, &pool_account_id).await?;
+    assert!(
+        initial_public_keys.is_empty(),
+        "Pool should have no public keys initially"
+    );
+    println!(
+        "\n [LOG] Initial public keys count: {}",
+        initial_public_keys.len()
+    );
 
     // Register first worker (Alice)
     println!("Registering first worker (Alice)...");
@@ -32,6 +47,22 @@ async fn test_only_one_active_worker_per_pool() -> Result<(), Box<dyn std::error
     println!(
         "\n [LOG] First Worker (Alice): {{ checksum: {}, compose_hash: {}, pool_id: {} }}",
         worker.checksum, worker.compose_hash, worker.pool_id
+    );
+
+    // Verify that Alice's public key is now in the mock-intents contract for the pool
+    let alice_public_keys = get_pool_public_keys(&mock_intents, &pool_account_id).await?;
+    assert_eq!(
+        alice_public_keys.len(),
+        1,
+        "Pool should have exactly one public key after Alice's registration"
+    );
+    assert!(
+        alice_public_keys.contains(&worker.public_key),
+        "Pool should contain Alice's public key"
+    );
+    println!(
+        "\n [LOG] Public keys after Alice registration: {}",
+        alice_public_keys.len()
     );
 
     // Try to register second worker (Bob) for the same pool - this should fail
@@ -62,6 +93,22 @@ async fn test_only_one_active_worker_per_pool() -> Result<(), Box<dyn std::error
         "Alice should still be registered for pool 0"
     );
 
+    // Verify that the pool still only contains Alice's public key
+    let final_public_keys = get_pool_public_keys(&mock_intents, &pool_account_id).await?;
+    assert_eq!(
+        final_public_keys.len(),
+        1,
+        "Pool should still have exactly one public key"
+    );
+    assert!(
+        final_public_keys.contains(&alice_worker.public_key),
+        "Pool should still contain only Alice's public key"
+    );
+    println!(
+        "\n [LOG] Final public keys count: {}",
+        final_public_keys.len()
+    );
+
     println!("Test passed: Only one active worker is allowed per pool");
 
     Ok(())
@@ -73,7 +120,7 @@ async fn test_worker_ping_functionality() -> Result<(), Box<dyn std::error::Erro
     let sandbox = near_workspaces::sandbox().await?;
 
     // Setup test environment
-    let (wnear, usdc, owner, alice, bob, _mock_intents, solver_registry) =
+    let (wnear, usdc, owner, alice, bob, mock_intents, solver_registry) =
         setup_test_environment(&sandbox, 10 * 60 * 1000).await?;
 
     // Create a liquidity pool
@@ -82,6 +129,21 @@ async fn test_worker_ping_functionality() -> Result<(), Box<dyn std::error::Erro
     // Approve compose hash
     approve_compose_hash(&owner, &solver_registry).await?;
 
+    // Get pool account ID
+    let pool_account_id = get_pool_account_id(&solver_registry, 0);
+    println!("\n [LOG] Pool Account ID: {}", pool_account_id);
+
+    // Verify no public keys exist for the pool initially
+    let initial_public_keys = get_pool_public_keys(&mock_intents, &pool_account_id).await?;
+    assert!(
+        initial_public_keys.is_empty(),
+        "Pool should have no public keys initially"
+    );
+    println!(
+        "\n [LOG] Initial public keys count: {}",
+        initial_public_keys.len()
+    );
+
     // Register worker (Alice)
     println!("Registering worker (Alice)...");
     let result = register_worker_alice(&alice, &solver_registry, 0).await?;
@@ -89,6 +151,24 @@ async fn test_worker_ping_functionality() -> Result<(), Box<dyn std::error::Erro
         result.is_success(),
         "Worker registration should succeed: {:#?}",
         result.into_result().unwrap_err()
+    );
+
+    // Verify that Alice's public key is now in the mock-intents contract for the pool
+    let alice_worker_option = get_worker_info(&solver_registry, &alice).await?;
+    let alice_worker = alice_worker_option.expect("Alice should be registered as a worker");
+    let alice_public_keys = get_pool_public_keys(&mock_intents, &pool_account_id).await?;
+    assert_eq!(
+        alice_public_keys.len(),
+        1,
+        "Pool should have exactly one public key after Alice's registration"
+    );
+    assert!(
+        alice_public_keys.contains(&alice_worker.public_key),
+        "Pool should contain Alice's public key"
+    );
+    println!(
+        "\n [LOG] Public keys after Alice registration: {}",
+        alice_public_keys.len()
     );
 
     // Get initial pool state
@@ -120,6 +200,18 @@ async fn test_worker_ping_functionality() -> Result<(), Box<dyn std::error::Erro
         "Ping timestamp should be updated"
     );
 
+    // Verify that Alice's public key is still the only one in the pool
+    let public_keys_after_ping = get_pool_public_keys(&mock_intents, &pool_account_id).await?;
+    assert_eq!(
+        public_keys_after_ping.len(),
+        1,
+        "Pool should still have exactly one public key after ping"
+    );
+    assert!(
+        public_keys_after_ping.contains(&alice_worker.public_key),
+        "Pool should still contain Alice's public key after ping"
+    );
+
     // Test that only the registered worker can ping
     println!("Testing that only the registered worker can ping...");
     let result = ping_worker(&bob, &solver_registry).await?;
@@ -132,6 +224,19 @@ async fn test_worker_ping_functionality() -> Result<(), Box<dyn std::error::Erro
 
     let error = result.into_result().unwrap_err();
     println!("Expected error received: {:?}", error);
+
+    // Verify that Bob's public key is not in the pool
+    let public_keys_after_bob_ping_attempt =
+        get_pool_public_keys(&mock_intents, &pool_account_id).await?;
+    assert_eq!(
+        public_keys_after_bob_ping_attempt.len(),
+        1,
+        "Pool should still have exactly one public key after Bob's failed ping attempt"
+    );
+    assert!(
+        public_keys_after_bob_ping_attempt.contains(&alice_worker.public_key),
+        "Pool should still contain only Alice's public key after Bob's failed ping attempt"
+    );
 
     // Verify that Alice can still ping successfully
     println!("Worker (Alice) pinging again...");
@@ -155,6 +260,22 @@ async fn test_worker_ping_functionality() -> Result<(), Box<dyn std::error::Erro
         "Final ping timestamp should be greater than the previous ping"
     );
 
+    // Verify that Alice's public key is still the only one in the pool
+    let final_public_keys = get_pool_public_keys(&mock_intents, &pool_account_id).await?;
+    assert_eq!(
+        final_public_keys.len(),
+        1,
+        "Pool should still have exactly one public key at the end"
+    );
+    assert!(
+        final_public_keys.contains(&alice_worker.public_key),
+        "Pool should still contain only Alice's public key at the end"
+    );
+    println!(
+        "\n [LOG] Final public keys count: {}",
+        final_public_keys.len()
+    );
+
     println!("Test passed: Worker ping functionality works correctly");
 
     Ok(())
@@ -166,7 +287,7 @@ async fn test_worker_replacement_after_timeout() -> Result<(), Box<dyn std::erro
     let sandbox = near_workspaces::sandbox().await?;
 
     // Setup test environment with shorter timeout for testing
-    let (wnear, usdc, owner, alice, bob, _mock_intents, solver_registry) =
+    let (wnear, usdc, owner, alice, bob, mock_intents, solver_registry) =
         setup_test_environment(&sandbox, 5 * 1000).await?;
 
     // Create a liquidity pool
@@ -174,6 +295,21 @@ async fn test_worker_replacement_after_timeout() -> Result<(), Box<dyn std::erro
 
     // Approve compose hash
     approve_compose_hash(&owner, &solver_registry).await?;
+
+    // Get pool account ID
+    let pool_account_id = get_pool_account_id(&solver_registry, 0);
+    println!("\n [LOG] Pool Account ID: {}", pool_account_id);
+
+    // Verify no public keys exist for the pool initially
+    let initial_public_keys = get_pool_public_keys(&mock_intents, &pool_account_id).await?;
+    assert!(
+        initial_public_keys.is_empty(),
+        "Pool should have no public keys initially"
+    );
+    println!(
+        "\n [LOG] Initial public keys count: {}",
+        initial_public_keys.len()
+    );
 
     // Register first worker (Alice)
     println!("Registering first worker (Alice)...");
@@ -205,6 +341,19 @@ async fn test_worker_replacement_after_timeout() -> Result<(), Box<dyn std::erro
     let error = result.into_result().unwrap_err();
     println!("Expected error received: {:?}", error);
 
+    // Verify that the pool still only contains Alice's public key
+    let public_keys_after_failed_bob_registration =
+        get_pool_public_keys(&mock_intents, &pool_account_id).await?;
+    assert_eq!(
+        public_keys_after_failed_bob_registration.len(),
+        1,
+        "Pool should still have exactly one public key after failed Bob registration"
+    );
+    assert!(
+        public_keys_after_failed_bob_registration.contains(&worker.public_key),
+        "Pool should still contain only Alice's public key after failed Bob registration"
+    );
+
     // Wait for the worker timeout (5 seconds) to allow worker replacement
     wait_for_worker_timeout(5).await;
 
@@ -235,12 +384,32 @@ async fn test_worker_replacement_after_timeout() -> Result<(), Box<dyn std::erro
     );
     assert_eq!(bob_worker.pool_id, 0, "Bob should be registered for pool 0");
 
+    // Verify that the pool now contains Bob's public key instead of Alice's
+    let public_keys_after_bob_registration =
+        get_pool_public_keys(&mock_intents, &pool_account_id).await?;
+    assert_eq!(
+        public_keys_after_bob_registration.len(),
+        1,
+        "Pool should have exactly one public key after Bob's registration"
+    );
+    assert!(
+        public_keys_after_bob_registration.contains(&bob_worker.public_key),
+        "Pool should contain Bob's public key after registration"
+    );
+    assert!(
+        !public_keys_after_bob_registration.contains(&worker.public_key),
+        "Pool should no longer contain Alice's public key after Bob's registration"
+    );
+    println!(
+        "\n [LOG] Public keys after Bob registration: {}",
+        public_keys_after_bob_registration.len()
+    );
+
     // Verify that Alice is still registered although it's not active
     let alice_worker_option = get_worker_info(&solver_registry, &alice).await?;
-    let alice_worker = alice_worker_option.expect("Alice should still exists as a worker");
-    assert_eq!(
-        alice_worker.pool_id, 0,
-        "Alice should still be registered for pool 0"
+    assert!(
+        alice_worker_option.is_none(),
+        "Alice should has been removed"
     );
 
     // Verify that Bob is now the active worker for the pool
@@ -267,7 +436,7 @@ async fn test_worker_cannot_register_while_active_worker_is_pinging(
     let sandbox = near_workspaces::sandbox().await?;
 
     // Setup test environment with short timeout for testing (5 seconds)
-    let (wnear, usdc, owner, alice, bob, _mock_intents, solver_registry) =
+    let (wnear, usdc, owner, alice, bob, mock_intents, solver_registry) =
         setup_test_environment(&sandbox, 5 * 1000).await?;
 
     // Create a liquidity pool
@@ -291,6 +460,23 @@ async fn test_worker_cannot_register_while_active_worker_is_pinging(
     println!(
         "\n [LOG] Alice registered: {{ checksum: {}, compose_hash: {}, pool_id: {} }}",
         alice_worker.checksum, alice_worker.compose_hash, alice_worker.pool_id
+    );
+
+    // Verify that Alice's public key is now in the mock-intents contract for the pool
+    let pool_account_id = get_pool_account_id(&solver_registry, 0);
+    let alice_public_keys = get_pool_public_keys(&mock_intents, &pool_account_id).await?;
+    assert_eq!(
+        alice_public_keys.len(),
+        1,
+        "Pool should have exactly one public key after Alice's registration"
+    );
+    assert!(
+        alice_public_keys.contains(&alice_worker.public_key),
+        "Pool should contain Alice's public key"
+    );
+    println!(
+        "\n [LOG] Public keys after Alice registration: {}",
+        alice_public_keys.len()
     );
 
     // Get initial pool state
@@ -320,6 +506,20 @@ async fn test_worker_cannot_register_while_active_worker_is_pinging(
     assert!(
         pool_after_initial_ping.last_ping_timestamp_ms > pool_initial.last_ping_timestamp_ms,
         "Ping timestamp should be updated after initial ping"
+    );
+
+    // Verify that Alice's public key is still the only one in the pool
+    let pool_account_id = get_pool_account_id(&solver_registry, 0);
+    let public_keys_after_initial_ping =
+        get_pool_public_keys(&mock_intents, &pool_account_id).await?;
+    assert_eq!(
+        public_keys_after_initial_ping.len(),
+        1,
+        "Pool should still have exactly one public key after initial ping"
+    );
+    assert!(
+        public_keys_after_initial_ping.contains(&alice_worker.public_key),
+        "Pool should still contain Alice's public key after initial ping"
     );
 
     // Now Alice stops pinging and we wait for the timeout
@@ -363,6 +563,19 @@ async fn test_worker_cannot_register_while_active_worker_is_pinging(
     let error = result.into_result().unwrap_err();
     println!("Expected error received: {:?}", error);
 
+    // Verify that Bob's public key is not in the pool
+    let public_keys_after_failed_bob_registration =
+        get_pool_public_keys(&mock_intents, &pool_account_id).await?;
+    assert_eq!(
+        public_keys_after_failed_bob_registration.len(),
+        1,
+        "Pool should still have exactly one public key after failed Bob registration"
+    );
+    assert!(
+        public_keys_after_failed_bob_registration.contains(&alice_worker.public_key),
+        "Pool should still contain only Alice's public key after failed Bob registration"
+    );
+
     // Verify that Bob is not registered as a worker
     let bob_worker_option = get_worker_info(&solver_registry, &bob).await?;
     assert!(
@@ -385,6 +598,18 @@ async fn test_worker_cannot_register_while_active_worker_is_pinging(
         pool_final.worker_id,
         Some(alice.id().clone()),
         "Alice should still be the active worker for the pool"
+    );
+
+    // Verify that Alice's public key is still the only one in the pool
+    let public_keys_final = get_pool_public_keys(&mock_intents, &pool_account_id).await?;
+    assert_eq!(
+        public_keys_final.len(),
+        1,
+        "Pool should still have exactly one public key at the end"
+    );
+    assert!(
+        public_keys_final.contains(&alice_worker.public_key),
+        "Pool should still contain only Alice's public key at the end"
     );
 
     // Alice pings one more time to demonstrate she's still active
@@ -410,6 +635,22 @@ async fn test_worker_cannot_register_while_active_worker_is_pinging(
         "Final ping timestamp should be greater than the previous ping"
     );
 
+    // Verify that Alice's public key is still the only one in the pool after final ping
+    let final_public_keys = get_pool_public_keys(&mock_intents, &pool_account_id).await?;
+    assert_eq!(
+        final_public_keys.len(),
+        1,
+        "Pool should still have exactly one public key after final ping"
+    );
+    assert!(
+        final_public_keys.contains(&alice_worker.public_key),
+        "Pool should still contain only Alice's public key after final ping"
+    );
+    println!(
+        "\n [LOG] Final public keys count: {}",
+        final_public_keys.len()
+    );
+
     println!("Test passed: Worker cannot register while active worker is pinging");
 
     Ok(())
@@ -422,7 +663,7 @@ async fn test_worker_can_register_after_inactive_worker_timeout(
     let sandbox = near_workspaces::sandbox().await?;
 
     // Setup test environment with short timeout for testing (5 seconds)
-    let (wnear, usdc, owner, alice, bob, _mock_intents, solver_registry) =
+    let (wnear, usdc, owner, alice, bob, mock_intents, solver_registry) =
         setup_test_environment(&sandbox, 5 * 1000).await?;
 
     // Create a liquidity pool
@@ -515,12 +756,33 @@ async fn test_worker_can_register_after_inactive_worker_timeout(
     );
     assert_eq!(bob_worker.pool_id, 0, "Bob should be registered for pool 0");
 
+    // Verify that the pool now contains Bob's public key instead of Alice's
+    let pool_account_id = get_pool_account_id(&solver_registry, 0);
+    let public_keys_after_bob_registration =
+        get_pool_public_keys(&mock_intents, &pool_account_id).await?;
+    assert_eq!(
+        public_keys_after_bob_registration.len(),
+        1,
+        "Pool should have exactly one public key after Bob's registration"
+    );
+    assert!(
+        public_keys_after_bob_registration.contains(&bob_worker.public_key),
+        "Pool should contain Bob's public key after registration"
+    );
+    assert!(
+        !public_keys_after_bob_registration.contains(&alice_worker.public_key),
+        "Pool should no longer contain Alice's public key after Bob's registration"
+    );
+    println!(
+        "\n [LOG] Public keys after Bob registration: {}",
+        public_keys_after_bob_registration.len()
+    );
+
     // Verify that Alice is still registered although it's not active
     let alice_worker_option = get_worker_info(&solver_registry, &alice).await?;
-    let alice_worker = alice_worker_option.expect("Alice should still exists as a worker");
-    assert_eq!(
-        alice_worker.pool_id, 0,
-        "Alice should still be registered for pool 0"
+    assert!(
+        alice_worker_option.is_none(),
+        "Alice should has been removed"
     );
 
     // Verify that Bob is now the active worker for the pool
@@ -557,6 +819,18 @@ async fn test_worker_can_register_after_inactive_worker_timeout(
         "Bob's ping should update the timestamp"
     );
 
+    // Verify that the pool still contains Bob's public key after his ping
+    let public_keys_after_bob_ping = get_pool_public_keys(&mock_intents, &pool_account_id).await?;
+    assert_eq!(
+        public_keys_after_bob_ping.len(),
+        1,
+        "Pool should still have exactly one public key after Bob's ping"
+    );
+    assert!(
+        public_keys_after_bob_ping.contains(&bob_worker.public_key),
+        "Pool should still contain Bob's public key after his ping"
+    );
+
     // Verify that Alice cannot ping anymore (she's no longer registered)
     println!("Testing that Alice cannot ping after being replaced...");
     let result = ping_worker(&alice, &solver_registry).await?;
@@ -579,11 +853,26 @@ async fn test_worker_ping_without_registration() -> Result<(), Box<dyn std::erro
     let sandbox = near_workspaces::sandbox().await?;
 
     // Setup test environment
-    let (wnear, usdc, _owner, alice, _bob, _mock_intents, solver_registry) =
+    let (wnear, usdc, _owner, alice, _bob, mock_intents, solver_registry) =
         setup_test_environment(&sandbox, 10 * 60 * 1000).await?;
 
     // Create a liquidity pool
     create_liquidity_pool(&solver_registry, &wnear, &usdc).await?;
+
+    // Get pool account ID
+    let pool_account_id = get_pool_account_id(&solver_registry, 0);
+    println!("\n [LOG] Pool Account ID: {}", pool_account_id);
+
+    // Verify no public keys exist for the pool initially
+    let initial_public_keys = get_pool_public_keys(&mock_intents, &pool_account_id).await?;
+    assert!(
+        initial_public_keys.is_empty(),
+        "Pool should have no public keys initially"
+    );
+    println!(
+        "\n [LOG] Initial public keys count: {}",
+        initial_public_keys.len()
+    );
 
     // Try to ping without being registered as a worker
     println!("Attempting to ping without worker registration...");
@@ -597,6 +886,17 @@ async fn test_worker_ping_without_registration() -> Result<(), Box<dyn std::erro
 
     let error = result.into_result().unwrap_err();
     println!("Expected error received: {:?}", error);
+
+    // Verify that the pool still has no public keys after failed ping attempt
+    let final_public_keys = get_pool_public_keys(&mock_intents, &pool_account_id).await?;
+    assert!(
+        final_public_keys.is_empty(),
+        "Pool should still have no public keys after failed ping attempt"
+    );
+    println!(
+        "\n [LOG] Final public keys count: {}",
+        final_public_keys.len()
+    );
 
     println!("Test passed: Worker ping requires registration");
 

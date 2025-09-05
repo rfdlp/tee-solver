@@ -5,7 +5,7 @@ use hex::decode;
 use near_sdk::{
     assert_one_yocto,
     env::{self, block_timestamp, block_timestamp_ms, sha256},
-    ext_contract, near, require,
+    near, require,
     store::{IterableMap, IterableSet, Vector},
     AccountId, Gas, NearToken, PanicOnDefault, Promise, PromiseError, PublicKey,
 };
@@ -20,6 +20,7 @@ use crate::attestation::{
     report_data::ReportData,
 };
 use crate::events::*;
+use crate::ext::*;
 use crate::pool::*;
 use crate::types::*;
 
@@ -33,7 +34,12 @@ pub mod types;
 mod upgrade;
 mod view;
 
-const GAS_REGISTER_WORKER_CALLBACK: Gas = Gas::from_tgas(10);
+const GAS_ADD_WORKER_KEY: Gas = Gas::from_tgas(20);
+const GAS_REMOVE_WORKER_KEY: Gas = Gas::from_tgas(20);
+const GAS_ADD_WORKER_KEY_CALLBACK: Gas = Gas::from_tgas(10);
+const GAS_REMOVE_WORKER_KEY_CALLBACK: Gas = Gas::from_tgas(20) // 20 Tgas for the callback function itself
+    .saturating_add(GAS_ADD_WORKER_KEY)
+    .saturating_add(GAS_ADD_WORKER_KEY_CALLBACK);
 
 #[near(serializers = [json, borsh])]
 #[derive(Clone)]
@@ -41,6 +47,7 @@ pub struct Worker {
     pub pool_id: u32,
     pub checksum: String,
     pub compose_hash: String,
+    pub public_key: PublicKey,
 }
 
 #[near(contract_state)]
@@ -52,12 +59,6 @@ pub struct Contract {
     approved_compose_hashes: IterableSet<String>,
     worker_by_account_id: IterableMap<AccountId, Worker>,
     worker_ping_timeout_ms: TimestampMs,
-}
-
-#[allow(dead_code)]
-#[ext_contract(ext_intents_vault)]
-trait IntentsVaultContract {
-    fn add_public_key(intents_contract_id: AccountId, public_key: PublicKey);
 }
 
 #[near]
@@ -152,21 +153,81 @@ impl Contract {
             .expect("Invalid docker compose hash");
         let docker_compose_hash_hex = docker_compose_hash.as_hex();
 
-        // Add the public key to the intents vault
-        ext_intents_vault::ext(self.get_pool_account_id(pool_id))
-            .with_attached_deposit(NearToken::from_yoctonear(1))
-            .add_public_key(self.intents_contract_id.clone(), public_key.clone())
-            .then(
-                Self::ext(env::current_account_id())
-                    .with_static_gas(GAS_REGISTER_WORKER_CALLBACK)
-                    .on_worker_key_added(
-                        worker_id,
-                        pool_id,
-                        public_key,
-                        docker_compose_hash_hex,
-                        checksum,
-                    ),
+        // Remove the public key of the inactive worker if exists
+        if let Some(inactive_worker_id) = pool.worker_id.as_ref() {
+            let inactive_worker = self
+                .worker_by_account_id
+                .get(inactive_worker_id)
+                .expect("Worker not registered");
+            ext_intents_vault::ext(self.get_pool_account_id(pool_id))
+                .with_attached_deposit(NearToken::from_yoctonear(1))
+                .with_static_gas(GAS_REMOVE_WORKER_KEY)
+                .with_unused_gas_weight(0)
+                .remove_public_key(
+                    self.intents_contract_id.clone(),
+                    inactive_worker.public_key.clone(),
+                )
+                .then(
+                    Self::ext(env::current_account_id())
+                        .with_static_gas(GAS_REMOVE_WORKER_KEY_CALLBACK)
+                        .with_unused_gas_weight(0)
+                        .on_inactive_worker_key_removed(
+                            worker_id,
+                            pool_id,
+                            public_key,
+                            docker_compose_hash_hex,
+                            checksum,
+                        ),
+                )
+        } else {
+            self.register_new_public_key(
+                worker_id,
+                pool_id,
+                public_key,
+                docker_compose_hash_hex,
+                checksum,
             )
+        }
+    }
+
+    #[private]
+    pub fn on_inactive_worker_key_removed(
+        &mut self,
+        worker_id: AccountId,
+        pool_id: u32,
+        public_key: PublicKey,
+        docker_compose_hash_hex: String,
+        checksum: String,
+        #[callback_result] call_result: Result<(), PromiseError>,
+    ) -> Promise {
+        if call_result.is_ok() {
+            // remove inactive worker
+            let pool = self.pools.get(pool_id).expect("Pool not found");
+            let inactive_worker_id = pool.worker_id.as_ref().expect("Pool has no worker");
+            let inactive_worker = self
+                .worker_by_account_id
+                .remove(inactive_worker_id)
+                .expect("Worker not registered");
+            Event::WorkerRemoved {
+                worker_id: inactive_worker_id,
+                pool_id: &pool_id,
+                public_key: &inactive_worker.public_key,
+                compose_hash: &inactive_worker.compose_hash,
+                checksum: &inactive_worker.checksum,
+            }
+            .emit();
+
+            // register new worker and its key
+            self.register_new_public_key(
+                worker_id,
+                pool_id,
+                public_key,
+                docker_compose_hash_hex,
+                checksum,
+            )
+        } else {
+            env::panic_str("Failed to remove inactive worker key");
+        }
     }
 
     #[private]
@@ -186,6 +247,7 @@ impl Contract {
                     pool_id,
                     checksum: checksum.clone(),
                     compose_hash: compose_hash.clone(),
+                    public_key: public_key.clone(),
                 },
             );
 
@@ -213,6 +275,7 @@ impl Contract {
             .get_worker(worker_id.clone())
             .expect("Worker not found");
         self.assert_approved_compose_hash(&worker.compose_hash);
+
         let pool = self.pools.get_mut(worker.pool_id).expect("Pool not found");
         let registered_worker_id = pool.worker_id.as_ref().expect("Worker not registered");
         require!(
@@ -257,5 +320,33 @@ impl Contract {
             .iter()
             .find(|hash| hash.as_hex() == hex::encode(&compose_hash))
             .cloned()
+    }
+
+    fn register_new_public_key(
+        &mut self,
+        worker_id: AccountId,
+        pool_id: u32,
+        public_key: PublicKey,
+        docker_compose_hash_hex: String,
+        checksum: String,
+    ) -> Promise {
+        // Add the public key to the intents vault
+        ext_intents_vault::ext(self.get_pool_account_id(pool_id))
+            .with_attached_deposit(NearToken::from_yoctonear(1))
+            .with_static_gas(GAS_ADD_WORKER_KEY)
+            .with_unused_gas_weight(0)
+            .add_public_key(self.intents_contract_id.clone(), public_key.clone())
+            .then(
+                Self::ext(env::current_account_id())
+                    .with_static_gas(GAS_ADD_WORKER_KEY_CALLBACK)
+                    .with_unused_gas_weight(0)
+                    .on_worker_key_added(
+                        worker_id,
+                        pool_id,
+                        public_key,
+                        docker_compose_hash_hex,
+                        checksum,
+                    ),
+            )
     }
 }
