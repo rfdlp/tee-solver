@@ -31,5 +31,5 @@ test: solver-registry intents-vault mock-intents mock-ft
 
 define compile-release
 	@rustup target add wasm32-unknown-unknown
-	@cd contracts/$(1) && cargo near build non-reproducible-wasm $(if $(2),--features $(2))
+	@cd contracts/$(1) && cargo near build non-reproducible-wasm --no-wasmopt $(if $(2),--features $(2))
 endef
